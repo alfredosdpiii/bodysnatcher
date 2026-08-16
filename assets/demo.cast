@@ -1,0 +1,7 @@
+{"version": 2, "width": 104, "height": 14, "timestamp": 1786871036, "idle_time_limit": 1.0, "env": {"SHELL": null, "TERM": "dumb"}}
+[0.007517, "o", "\u001b[1;33m$\u001b[0m bodysnatcher --version\r\n"]
+[0.510299, "o", "bodysnatcher 0.2.0\r\n"]
+[1.511936, "o", "\r\n\u001b[1;33m$\u001b[0m bodysnatcher convert session.jsonl --from omp --to claude\r\n"]
+[2.315036, "o", "/tmp/bodysnatcher-demo-home/.claude/projects/-demo-app/541de6db-ed02-4b30-9dfc-7db363829fad.jsonl\r\nbodysnatcher: omp session \"Fix auth bug\" (3 msgs) -> /tmp/bodysnatcher-demo-home/.claude/projects/-demo-app/541de6db-ed02-4b30-9dfc-7db363829fad.jsonl\r\n"]
+[3.316188, "o", "\r\n\u001b[1;36mNext\u001b[0m  claude --resume <session-id-from-path>\r\n\u001b[2mPreserved: messages, thinking, tool calls, and tool results.\u001b[0m\r\n"]
+[4.318612, "o", "\r\n\u001b[1;32mOne session. Any harness. Keep coding.\u001b[0m\r\n"]

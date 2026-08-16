@@ -11,6 +11,8 @@ replaces itself with the harness' native resume command. The target harness
 loads the converted history as if it had written it and continues the
 conversation from there.
 
+![Convert an OMP session to Claude Code, then resume it](assets/demo.gif)
+
 ## Install
 
 ```sh
