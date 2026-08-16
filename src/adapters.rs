@@ -392,7 +392,12 @@ pub fn write_session(
     src: &Session,
     msgs: &[Msg],
 ) -> std::io::Result<PathBuf> {
-    let new_id = uuid();
+    // Factory resolves sessions by `<id>.jsonl` filename with a dashed UUID;
+    // Pi/OMP resume by path, so their timestamped names stay as-is.
+    let new_id = match target {
+        Harness::Factory => uuid_v4(),
+        Harness::Pi | Harness::Omp => uuid(),
+    };
     let root = store.root(target);
     let ws_dir = root.join(slug_for(target, &src.cwd));
     fs::create_dir_all(&ws_dir)?;
@@ -400,7 +405,11 @@ pub fn write_session(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis();
-    let path = ws_dir.join(format!("{now_ms}_{new_id}.jsonl"));
+    let filename = match target {
+        Harness::Factory => format!("{new_id}.jsonl"),
+        Harness::Pi | Harness::Omp => format!("{now_ms}_{new_id}.jsonl"),
+    };
+    let path = ws_dir.join(filename);
     let mut w = fs::File::create(&path)?;
 
     match target {
@@ -410,40 +419,44 @@ pub fn write_session(
                 "id": new_id,
                 "title": src.title,
                 "isSessionTitleManuallySet": true,
+                "owner": factory_owner(),
                 "version": 2,
                 "cwd": src.cwd,
             });
             writeln!(w, "{start}")?;
+            // droid rebuilds the conversation from a parentId chain of
+            // dashed-uuid record ids; without it the loader drops every message
+            let mut parent: Option<String> = None;
             let mut i = 0;
             while i < msgs.len() {
                 let m = &msgs[i];
                 let ts = m.ts.clone().unwrap_or_else(|| ts_iso(src));
-                match m.role {
+                let rid = uuid_v4();
+                let parent_id = parent.clone();
+                let mut rec = match m.role {
                     Role::Assistant => {
-                        let rec = json!({
+                        i += 1;
+                        json!({
                             "type": "message",
-                            "id": uuid(),
+                            "id": rid,
                             "timestamp": ts,
                             "message": {
                                 "role": "assistant",
                                 "content": blocks_to_factory(&m.blocks),
                             }
-                        });
-                        writeln!(w, "{rec}")?;
-                        i += 1;
+                        })
                     }
                     Role::User => {
-                        let rec = json!({
+                        i += 1;
+                        json!({
                             "type": "message",
-                            "id": uuid(),
+                            "id": rid,
                             "timestamp": ts,
                             "message": {
                                 "role": "user",
                                 "content": [{"type": "text", "text": user_text_of(&m.blocks)}],
                             }
-                        });
-                        writeln!(w, "{rec}")?;
-                        i += 1;
+                        })
                     }
                     Role::Tool => {
                         // group consecutive tool results into one user message
@@ -465,15 +478,21 @@ pub fn write_session(
                             }
                             i += 1;
                         }
-                        let rec = json!({
+                        json!({
                             "type": "message",
-                            "id": uuid(),
+                            "id": rid,
                             "timestamp": ts,
                             "message": { "role": "user", "content": content },
-                        });
-                        writeln!(w, "{rec}")?;
+                        })
                     }
+                };
+                // Factory's loader rejects a root record with `parentId: null`;
+                // native root records omit the key entirely.
+                if let Some(parent_id) = parent_id {
+                    rec["parentId"] = Value::String(parent_id);
                 }
+                writeln!(w, "{rec}")?;
+                parent = Some(rid);
             }
         }
         Harness::Pi | Harness::Omp => {
@@ -603,12 +622,22 @@ fn user_text_of(blocks: &[Block]) -> String {
         .join("\n")
 }
 
+fn factory_owner() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
+}
+
 fn blocks_to_factory(blocks: &[Block]) -> Vec<Value> {
     blocks
         .iter()
         .filter_map(|b| match b {
             Block::Text(t) => Some(json!({"type": "text", "text": t})),
-            Block::Thinking(t) => Some(json!({"type": "thinking", "thinking": t})),
+            // droid's block schema requires signature fields on thinking
+            Block::Thinking(t) => Some(json!({
+                "type": "thinking",
+                "thinking": t,
+                "signature": "reasoning_content",
+                "signatureProvider": "factory",
+            })),
             Block::ToolCall { id, name, args } => Some(json!({
                 "type": "tool_use",
                 "id": id,
@@ -679,6 +708,29 @@ fn format_iso(secs: u64) -> String {
 fn short_hex() -> String {
     // 8-char hex like pi's entry ids
     uuid().chars().take(8).collect()
+}
+
+/// Dashed UUID v4 — Factory's session id/filename format.
+fn uuid_v4() -> String {
+    uuid_v4_from_hex(&uuid())
+}
+
+fn uuid_v4_from_hex(h: &str) -> String {
+    let mut s = String::with_capacity(36);
+    for (i, c) in h.chars().enumerate() {
+        if matches!(i, 8 | 12 | 16 | 20) {
+            s.push('-');
+        }
+        s.push(match i {
+            12 => '4',
+            16 => "89ab"
+                .chars()
+                .nth((h.as_bytes()[16] & 0x3) as usize)
+                .unwrap(),
+            _ => c,
+        });
+    }
+    s
 }
 
 #[cfg(test)]
@@ -824,6 +876,8 @@ mod tests {
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
+        assert!(lines[1].get("parentId").is_none());
+        assert_eq!(lines[2]["parentId"], lines[1]["id"]);
         assert_eq!(lines[0]["type"], "session_start");
         assert_eq!(lines[1]["message"]["role"], "user");
         assert!(
@@ -1003,6 +1057,43 @@ mod tests {
     }
 
     #[test]
+    fn uuid_v4_shape() {
+        assert_eq!(
+            uuid_v4_from_hex("00000000000000000000000000000000"),
+            "00000000-0000-4000-8000-000000000000"
+        );
+    }
+
+    #[test]
+    fn factory_filename_is_session_id() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let sess = bare_session(&dir, "");
+        let store = Store {
+            factory: dir.join("fac"),
+            pi: dir.join("pi"),
+            omp: dir.join("omp"),
+        };
+        let msgs = vec![Msg {
+            role: Role::User,
+            blocks: vec![Block::Text("hi".into())],
+            ts: None,
+        }];
+        let out = write_session(&store, Harness::Factory, &sess, &msgs).unwrap();
+        // droid resolves sessions by filename: stem must equal session_start.id
+        let stem = out.file_stem().unwrap().to_str().unwrap();
+        let first: Value =
+            serde_json::from_str(fs::read_to_string(&out).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(first["type"], "session_start");
+        assert_eq!(first["id"].as_str().unwrap(), stem);
+        let expected_owner = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        assert_eq!(first["owner"], expected_owner);
+        assert_eq!(stem.len(), 36);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn omp_title_slot_matches_loader_contract() {
         let line = title_slot_line("My session", "2026-08-16T00:00:00.000Z");
         // exactly 256 bytes including the newline (fixed-width physical slot)
@@ -1178,6 +1269,13 @@ mod tests {
         assert_eq!(content[1]["is_error"], true);
         // trailing user message survived the grouping loop
         assert_eq!(lines[3]["message"]["content"][0]["text"], "next");
+        // droid rebuilds history from the parentId chain.
+        assert!(lines[1].get("parentId").is_none());
+        for w in lines[1..].windows(2) {
+            assert_eq!(w[1]["parentId"], w[0]["id"]);
+        }
+        // record ids are dashed uuids
+        assert_eq!(lines[1]["id"].as_str().unwrap().len(), 36);
         // tools at the very end of the session: grouping loop must stop at len
         let mut tail = tool_msgs();
         tail.pop();
