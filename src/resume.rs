@@ -10,6 +10,8 @@ pub fn build(store: &Store, sess: &Session, target: Target) -> std::io::Result<C
         Target::Factory => Harness::Factory,
         Target::Pi => Harness::Pi,
         Target::Omp => Harness::Omp,
+        Target::Claude => Harness::Claude,
+        Target::Codex => Harness::Codex,
     };
 
     // Converted session: write into target store, resume that instead.
@@ -37,6 +39,14 @@ pub fn build(store: &Store, sess: &Session, target: Target) -> std::io::Result<C
             bin: "omp".into(),
             args: vec!["--resume".into(), path],
         },
+        Harness::Claude => Command {
+            bin: "claude".into(),
+            args: vec!["--resume".into(), id.into()],
+        },
+        Harness::Codex => Command {
+            bin: "codex".into(),
+            args: vec!["resume".into(), id.into()],
+        },
     })
 }
 
@@ -46,12 +56,16 @@ pub enum Target {
     Factory,
     Pi,
     Omp,
+    Claude,
+    Codex,
 }
 
 impl Target {
     pub fn next(self) -> Self {
         match self {
-            Target::Auto => Target::Omp,
+            Target::Auto => Target::Codex,
+            Target::Codex => Target::Claude,
+            Target::Claude => Target::Omp,
             Target::Omp => Target::Pi,
             Target::Pi => Target::Factory,
             Target::Factory => Target::Auto,
@@ -64,6 +78,8 @@ impl Target {
             Target::Factory => "FAC",
             Target::Pi => "PI",
             Target::Omp => "OMP",
+            Target::Claude => "CL",
+            Target::Codex => "CX",
         }
     }
 
@@ -73,6 +89,8 @@ impl Target {
             Target::Factory => "Factory Droid",
             Target::Pi => "Pi",
             Target::Omp => "OMP",
+            Target::Claude => "Claude Code",
+            Target::Codex => "Codex",
         }
     }
 }
@@ -95,6 +113,8 @@ pub fn describe(sess: &Session, target: Target) -> String {
         Target::Factory => Harness::Factory,
         Target::Pi => Harness::Pi,
         Target::Omp => Harness::Omp,
+        Target::Claude => Harness::Claude,
+        Target::Codex => Harness::Codex,
     };
 
     if t == sess.harness {
@@ -105,6 +125,8 @@ pub fn describe(sess: &Session, target: Target) -> String {
                 Harness::Factory => "droid -r",
                 Harness::Pi => "pi --session",
                 Harness::Omp => "omp --resume",
+                Harness::Claude => "claude --resume",
+                Harness::Codex => "codex resume",
             }
         )
     } else {
@@ -119,12 +141,18 @@ mod tests {
 
     #[test]
     fn target_cycles() {
-        assert_eq!(Target::Auto.next(), Target::Omp);
+        assert_eq!(Target::Auto.next(), Target::Codex);
+        assert_eq!(Target::Codex.next(), Target::Claude);
+        assert_eq!(Target::Claude.next(), Target::Omp);
         assert_eq!(Target::Factory.next(), Target::Auto);
         assert_eq!(Target::Omp.label(), "OMP");
         assert_eq!(Target::Factory.label(), "FAC");
+        assert_eq!(Target::Claude.label(), "CL");
+        assert_eq!(Target::Codex.label(), "CX");
         assert_eq!(Target::Omp.desc(), "OMP");
         assert_eq!(Target::Factory.desc(), "Factory Droid");
+        assert_eq!(Target::Claude.desc(), "Claude Code");
+        assert_eq!(Target::Codex.desc(), "Codex");
         assert_eq!(Target::Auto.desc(), "native harness");
     }
 
@@ -155,6 +183,8 @@ mod tests {
             factory: dir.join("fac"),
             pi: dir.join("pi"),
             omp: dir.join("omp"),
+            claude: dir.join("claude"),
+            codex: dir.join("codex"),
         };
         let cmd = build(&store, &sess, Target::Auto).unwrap();
         assert_eq!(cmd.bin, "omp");
@@ -163,6 +193,47 @@ mod tests {
             vec![PathBuf::from("--resume"), dir.join("s.jsonl")]
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn build_native_id_resume_commands() {
+        let dir = std::env::temp_dir().join(format!("bs-r-{}", crate::model::uuid()));
+        let store = Store {
+            factory: dir.join("fac"),
+            pi: dir.join("pi"),
+            omp: dir.join("omp"),
+            claude: dir.join("claude"),
+            codex: dir.join("codex"),
+        };
+        for (harness, target, bin, args) in [
+            (
+                Harness::Claude,
+                Target::Claude,
+                "claude",
+                vec![PathBuf::from("--resume"), PathBuf::from("session-id")],
+            ),
+            (
+                Harness::Codex,
+                Target::Codex,
+                "codex",
+                vec![PathBuf::from("resume"), PathBuf::from("session-id")],
+            ),
+        ] {
+            let sess = Session {
+                harness,
+                path: dir.join("s.jsonl"),
+                id: "session-id".into(),
+                title: "t".into(),
+                cwd: "/tmp".into(),
+                model: String::new(),
+                msgs: 0,
+                preview: String::new(),
+                modified: None,
+            };
+            let cmd = build(&store, &sess, target).unwrap();
+            assert_eq!(cmd.bin, bin);
+            assert_eq!(cmd.args, args);
+        }
     }
 
     #[test]

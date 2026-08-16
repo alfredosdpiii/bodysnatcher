@@ -4,8 +4,11 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-/// Discover every session under a harness store: <root>/<workspace>/*.jsonl.
+/// Discover every session under a harness store.
 pub fn discover(root: &Path, harness: Harness) -> Vec<Session> {
+    if harness == Harness::Codex {
+        return discover_codex(root, None);
+    }
     let mut out = Vec::new();
     let Ok(workspaces) = fs::read_dir(root) else {
         return out;
@@ -22,6 +25,9 @@ pub fn discover(root: &Path, harness: Harness) -> Vec<Session> {
 /// slug matches `cwd`, skip every other workspace. Keeps startup fast on
 /// machines with thousands of sessions spread across many projects.
 pub fn discover_for_cwd(root: &Path, harness: Harness, cwd: &Path) -> Vec<Session> {
+    if harness == Harness::Codex {
+        return discover_codex(root, Some(cwd));
+    }
     let ws = root.join(slug_for(harness, &cwd.to_string_lossy()));
     if !ws.is_dir() {
         return Vec::new();
@@ -44,6 +50,37 @@ fn discover_workspace(ws: &Path, harness: Harness) -> Vec<Session> {
         }
     }
     out
+}
+
+fn discover_codex(root: &Path, cwd: Option<&Path>) -> Vec<Session> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rollout-"))
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    // ponytail: one summary scan per rollout; add an index only if this becomes slow.
+    let mut paths = Vec::new();
+    walk(root, &mut paths);
+    paths.sort();
+    paths
+        .into_iter()
+        .filter_map(|path| summarize(&path, Harness::Codex))
+        .filter(|session| cwd.is_none_or(|cwd| session.cwd == cwd.to_string_lossy()))
+        .collect()
 }
 
 /// Cheap summary: header line + first user text + message count + mtime.
@@ -95,6 +132,56 @@ pub fn summarize(path: &Path, harness: Harness) -> Option<Session> {
                 }
                 _ => {}
             },
+            Harness::Claude => {
+                if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
+                let m = &v["message"];
+                let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+                if cwd.is_empty() {
+                    cwd = s(&v, "cwd");
+                }
+                if ty == "assistant" {
+                    msgs += 1;
+                    if model.is_empty() {
+                        model = s(m, "model");
+                    }
+                } else if ty == "user" && role == "user" {
+                    msgs += 1;
+                    if preview.is_empty()
+                        && let Some(t) = user_text(m)
+                    {
+                        preview = clip(&t);
+                        title = preview.clone();
+                    }
+                }
+            }
+            Harness::Codex => {
+                let payload = &v["payload"];
+                match ty {
+                    "session_meta" => {
+                        if id.is_empty() {
+                            id = s(payload, "id");
+                            if id.is_empty() {
+                                id = s(payload, "session_id");
+                            }
+                            cwd = s(payload, "cwd");
+                        }
+                    }
+                    "response_item" if payload["type"] == "message" => {
+                        msgs += 1;
+                        if payload["role"] == "user" && preview.is_empty() {
+                            let text = codex_text(&payload["content"], "input_text");
+                            if !text.is_empty() {
+                                preview = clip(&text);
+                                title = preview.clone();
+                            }
+                        }
+                    }
+                    "turn_context" if model.is_empty() => model = s(payload, "model"),
+                    _ => {}
+                }
+            }
             Harness::Pi | Harness::Omp => match ty {
                 "title" => {
                     if title.is_empty() {
@@ -184,6 +271,20 @@ fn user_text(m: &Value) -> Option<String> {
     }
 }
 
+fn codex_text(content: &Value, text_type: &str) -> String {
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some(ty) if ty == text_type => part.get("text").and_then(Value::as_str),
+            Some("input_image") => Some("[image]"),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn clip(s: &str) -> String {
     let s = s.replace('\n', " ");
     let s = s.trim();
@@ -214,14 +315,27 @@ pub fn parse(path: &Path, harness: Harness) -> std::io::Result<(Session, Vec<Msg
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if v.get("type").and_then(Value::as_str) != Some("message") {
+        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+        let is_conv = match harness {
+            Harness::Claude => {
+                v.get("message").and_then(|m| m.get("role")).is_some()
+                    && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            }
+            Harness::Codex => ty == "response_item",
+            _ => ty == "message",
+        };
+        if !is_conv {
+            continue;
+        }
+        let ts = v.get("timestamp").and_then(Value::as_str).map(String::from);
+        if harness == Harness::Codex {
+            parse_codex_item(&v["payload"], ts, &mut msgs);
             continue;
         }
         let m = &v["message"];
         let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-        let ts = v.get("timestamp").and_then(Value::as_str).map(String::from);
         match harness {
-            Harness::Factory => match role {
+            Harness::Factory | Harness::Claude => match role {
                 "assistant" => {
                     let blocks = assistant_blocks(&m["content"]);
                     if !blocks.is_empty() {
@@ -279,15 +393,69 @@ pub fn parse(path: &Path, harness: Harness) -> std::io::Result<(Session, Vec<Msg
                 }
                 _ => {}
             },
+            Harness::Codex => unreachable!(),
         }
     }
     sum.msgs = msgs.len();
     Ok((sum, msgs))
 }
 
+fn parse_codex_item(payload: &Value, ts: Option<String>, msgs: &mut Vec<Msg>) {
+    let (role, blocks) = match payload.get("type").and_then(Value::as_str) {
+        Some("message") => match payload.get("role").and_then(Value::as_str) {
+            Some("user") => (
+                Role::User,
+                vec![Block::Text(codex_text(&payload["content"], "input_text"))],
+            ),
+            Some("assistant") => (
+                Role::Assistant,
+                vec![Block::Text(codex_text(&payload["content"], "output_text"))],
+            ),
+            _ => return,
+        },
+        Some("reasoning") => {
+            let text = payload["summary"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (Role::Assistant, vec![Block::Thinking(text)])
+        }
+        Some("function_call") => {
+            let arguments = s(payload, "arguments");
+            (
+                Role::Assistant,
+                vec![Block::ToolCall {
+                    id: s(payload, "call_id"),
+                    name: s(payload, "name"),
+                    args: serde_json::from_str(&arguments).unwrap_or(Value::String(arguments)),
+                }],
+            )
+        }
+        Some("function_call_output") => (
+            Role::Tool,
+            vec![Block::ToolResult {
+                call_id: s(payload, "call_id"),
+                name: None,
+                content: s(payload, "output"),
+                is_error: false,
+            }],
+        ),
+        _ => return,
+    };
+    if !blocks
+        .iter()
+        .all(|block| matches!(block, Block::Text(t) | Block::Thinking(t) if t.is_empty()))
+    {
+        msgs.push(Msg { role, blocks, ts });
+    }
+}
+
 /// Canonical blocks from an assistant `content` value (array of blocks).
-/// Accepts both families: Factory uses `tool_use`/`input`, Pi/OMP use
-/// `toolCall`/`arguments`; both map to the same canonical `ToolCall`.
+/// Factory/Claude use `tool_use`/`input`; Pi/OMP use `toolCall`/`arguments`.
 fn assistant_blocks(content: &Value) -> Vec<Block> {
     let Value::Array(items) = content else {
         return content
@@ -335,8 +503,7 @@ fn assistant_blocks(content: &Value) -> Vec<Block> {
     out
 }
 
-/// Factory stores tool results inside a user message. Split them out: return
-/// the text-bearing user message (if any) plus one `Tool` message per result.
+/// Factory and Claude store tool results inside user messages. Split them out.
 fn split_factory_user(content: &Value, ts: Option<String>) -> (Option<Msg>, Vec<Msg>) {
     let mut tools = Vec::new();
     let mut text_blocks = Vec::new();
@@ -392,24 +559,39 @@ pub fn write_session(
     src: &Session,
     msgs: &[Msg],
 ) -> std::io::Result<PathBuf> {
-    // Factory resolves sessions by `<id>.jsonl` filename with a dashed UUID;
-    // Pi/OMP resume by path, so their timestamped names stay as-is.
     let new_id = match target {
-        Harness::Factory => uuid_v4(),
+        Harness::Factory | Harness::Claude | Harness::Codex => uuid_v4(),
         Harness::Pi | Harness::Omp => uuid(),
     };
-    let root = store.root(target);
-    let ws_dir = root.join(slug_for(target, &src.cwd));
-    fs::create_dir_all(&ws_dir)?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let filename = match target {
-        Harness::Factory => format!("{new_id}.jsonl"),
-        Harness::Pi | Harness::Omp => format!("{now_ms}_{new_id}.jsonl"),
+    let ts = ts_iso(src);
+    let path = match target {
+        Harness::Codex => {
+            let dir = store
+                .codex
+                .join(format!("{}/{}/{}", &ts[0..4], &ts[5..7], &ts[8..10]));
+            fs::create_dir_all(&dir)?;
+            dir.join(format!(
+                "rollout-{}-{new_id}.jsonl",
+                ts[..19].replace(':', "-")
+            ))
+        }
+        _ => {
+            let dir = store.root(target).join(slug_for(target, &src.cwd));
+            fs::create_dir_all(&dir)?;
+            let filename = match target {
+                Harness::Factory | Harness::Claude => format!("{new_id}.jsonl"),
+                Harness::Pi | Harness::Omp => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis();
+                    format!("{now_ms}_{new_id}.jsonl")
+                }
+                Harness::Codex => unreachable!(),
+            };
+            dir.join(filename)
+        }
     };
-    let path = ws_dir.join(filename);
     let mut w = fs::File::create(&path)?;
 
     match target {
@@ -442,7 +624,7 @@ pub fn write_session(
                             "timestamp": ts,
                             "message": {
                                 "role": "assistant",
-                                "content": blocks_to_factory(&m.blocks),
+                                "content": blocks_to_anthropic(&m.blocks),
                             }
                         })
                     }
@@ -493,6 +675,145 @@ pub fn write_session(
                 }
                 writeln!(w, "{rec}")?;
                 parent = Some(rid);
+            }
+        }
+        Harness::Claude => {
+            let mut parent: Option<String> = None;
+            let mut i = 0;
+            while i < msgs.len() {
+                let m = &msgs[i];
+                let rid = uuid_v4();
+                let message = match m.role {
+                    Role::Assistant => {
+                        i += 1;
+                        let mut message = json!({
+                            "role": "assistant",
+                            "content": blocks_to_anthropic(&m.blocks),
+                        });
+                        if !src.model.is_empty() {
+                            message["model"] = Value::String(src.model.clone());
+                        }
+                        message
+                    }
+                    Role::User => {
+                        i += 1;
+                        json!({
+                            "role": "user",
+                            "content": [{"type": "text", "text": user_text_of(&m.blocks)}],
+                        })
+                    }
+                    Role::Tool => {
+                        let mut content = Vec::new();
+                        while i < msgs.len() && msgs[i].role == Role::Tool {
+                            if let Some(Block::ToolResult {
+                                call_id,
+                                content: result,
+                                is_error,
+                                ..
+                            }) = msgs[i].blocks.first()
+                            {
+                                content.push(json!({
+                                    "type": "tool_result",
+                                    "tool_use_id": call_id,
+                                    "is_error": is_error,
+                                    "content": result,
+                                }));
+                            }
+                            i += 1;
+                        }
+                        json!({"role": "user", "content": content})
+                    }
+                };
+                let rec = json!({
+                    "type": message["role"],
+                    "message": message,
+                    "uuid": rid,
+                    "parentUuid": parent,
+                    "timestamp": m.ts.clone().unwrap_or_else(|| ts.clone()),
+                    "sessionId": new_id,
+                    "cwd": src.cwd,
+                    "isSidechain": false,
+                    "userType": "external",
+                    "version": "2.1.220",
+                });
+                writeln!(w, "{rec}")?;
+                parent = Some(rid);
+            }
+        }
+        Harness::Codex => {
+            let meta = json!({
+                "timestamp": ts,
+                "ordinal": 0,
+                "type": "session_meta",
+                "payload": {
+                    "session_id": new_id,
+                    "id": new_id,
+                    "timestamp": ts,
+                    "cwd": src.cwd,
+                    "originator": "bodysnatcher",
+                    "cli_version": "0.147.0",
+                    "source": "cli",
+                    "model_provider": "bodysnatcher",
+                }
+            });
+            writeln!(w, "{meta}")?;
+            let mut ordinal = 1;
+            for m in msgs {
+                let timestamp = m.ts.clone().unwrap_or_else(|| ts.clone());
+                let payloads: Vec<Value> = match m.role {
+                    Role::User => vec![json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_text_of(&m.blocks)}],
+                    })],
+                    Role::Assistant => m
+                        .blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            Block::Text(text) => Some(json!({
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": text}],
+                            })),
+                            Block::Thinking(text) => Some(json!({
+                                "type": "reasoning",
+                                "summary": [{"type": "summary_text", "text": text}],
+                                "content": null,
+                            })),
+                            Block::ToolCall { id, name, args } => Some(json!({
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": args.to_string(),
+                                "call_id": id,
+                            })),
+                            Block::ToolResult { .. } => None,
+                        })
+                        .collect(),
+                    Role::Tool => m
+                        .blocks
+                        .first()
+                        .and_then(|block| match block {
+                            Block::ToolResult {
+                                call_id, content, ..
+                            } => Some(vec![json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": content,
+                            })]),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                };
+                for payload in payloads {
+                    let rec = json!({
+                        "timestamp": timestamp,
+                        "ordinal": ordinal,
+                        "type": "response_item",
+                        "payload": payload,
+                    });
+                    writeln!(w, "{rec}")?;
+                    ordinal += 1;
+                }
             }
         }
         Harness::Pi | Harness::Omp => {
@@ -626,12 +947,11 @@ fn factory_owner() -> String {
     std::env::var("USER").unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn blocks_to_factory(blocks: &[Block]) -> Vec<Value> {
+fn blocks_to_anthropic(blocks: &[Block]) -> Vec<Value> {
     blocks
         .iter()
         .filter_map(|b| match b {
             Block::Text(t) => Some(json!({"type": "text", "text": t})),
-            // droid's block schema requires signature fields on thinking
             Block::Thinking(t) => Some(json!({
                 "type": "thinking",
                 "thinking": t,
@@ -759,6 +1079,20 @@ mod tests {
 {"type":"message","id":"zz3","parentId":null,"timestamp":"2026-07-01T09:00:04.000Z","message":{"role":"user","content":""}}
 "#;
 
+    const CLAUDE: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Inspect the parser"}]},"uuid":"10000000-0000-4000-8000-000000000000","parentUuid":null,"timestamp":"2026-08-16T01:00:00.000Z","sessionId":"32158ce3-e9bd-4203-a961-f0c85814f443","cwd":"/home/u/claude_app","isSidechain":false,"userType":"external","version":"2.1.220"}
+{"type":"assistant","message":{"role":"assistant","model":"claude-fable-5","content":[{"type":"thinking","thinking":"read first","signature":"sig"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"parser.rs"}}]},"uuid":"20000000-0000-4000-8000-000000000000","parentUuid":"10000000-0000-4000-8000-000000000000","timestamp":"2026-08-16T01:00:01.000Z","sessionId":"32158ce3-e9bd-4203-a961-f0c85814f443","cwd":"/home/u/claude_app","isSidechain":false,"userType":"external","version":"2.1.220"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"parser body"}]},"uuid":"30000000-0000-4000-8000-000000000000","parentUuid":"20000000-0000-4000-8000-000000000000","timestamp":"2026-08-16T01:00:02.000Z","sessionId":"32158ce3-e9bd-4203-a961-f0c85814f443","cwd":"/home/u/claude_app","isSidechain":false,"userType":"external","version":"2.1.220"}
+{"type":"user","message":{"role":"user","content":"sidechain noise"},"uuid":"40000000-0000-4000-8000-000000000000","parentUuid":null,"timestamp":"2026-08-16T01:00:03.000Z","sessionId":"32158ce3-e9bd-4203-a961-f0c85814f443","cwd":"/home/u/claude_app","isSidechain":true}
+"#;
+
+    const CODEX: &str = r#"{"timestamp":"2026-08-16T02:00:00.000Z","ordinal":0,"type":"session_meta","payload":{"id":"01a0076f-fffd-7250-9f48-f9358e71e6b2","session_id":"01a0076f-fffd-7250-9f48-f9358e71e6b2","timestamp":"2026-08-16T02:00:00.000Z","cwd":"/home/u/codex-app","originator":"codex_cli_rs","cli_version":"0.90.0","source":"cli"}}
+{"timestamp":"2026-08-16T02:00:01.000Z","ordinal":1,"type":"turn_context","payload":{"model":"gpt-5.6","cwd":"/home/u/codex-app"}}
+{"timestamp":"2026-08-16T02:00:02.000Z","ordinal":2,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Run the checks"},{"type":"input_image","image_url":"x"}]}}
+{"timestamp":"2026-08-16T02:00:03.000Z","ordinal":3,"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"inspect first"}],"content":null,"encrypted_content":"x"}}
+{"timestamp":"2026-08-16T02:00:04.000Z","ordinal":4,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Checking"}]}}
+{"timestamp":"2026-08-16T02:00:05.000Z","ordinal":5,"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"cargo test\"}","call_id":"call_1"}}
+{"timestamp":"2026-08-16T02:00:06.000Z","ordinal":6,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"ok"}}
+"#;
     #[test]
     fn parses_factory_fixture() {
         let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
@@ -807,6 +1141,200 @@ mod tests {
     }
 
     #[test]
+    fn parses_claude_fixture() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = write_fixture(&dir, "32158ce3-e9bd-4203-a961-f0c85814f443.jsonl", CLAUDE);
+        let (sess, msgs) = parse(&p, Harness::Claude).unwrap();
+        assert_eq!(sess.id, "32158ce3-e9bd-4203-a961-f0c85814f443");
+        assert_eq!(sess.cwd, "/home/u/claude_app");
+        assert_eq!(sess.model, "claude-fable-5");
+        assert_eq!(sess.title, "Inspect the parser");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs[0].blocks,
+            vec![Block::Text("Inspect the parser".into())]
+        );
+        assert_eq!(msgs[1].blocks[0], Block::Thinking("read first".into()));
+        assert_eq!(
+            msgs[1].blocks[1],
+            Block::ToolCall {
+                id: "toolu_1".into(),
+                name: "Read".into(),
+                args: json!({"file_path": "parser.rs"}),
+            }
+        );
+        assert_eq!(msgs[2].role, Role::Tool);
+        assert_eq!(sess.msgs, 3);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn parses_codex_fixture() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = write_fixture(&dir, "rollout-test.jsonl", CODEX);
+        let (sess, msgs) = parse(&p, Harness::Codex).unwrap();
+        assert_eq!(sess.id, "01a0076f-fffd-7250-9f48-f9358e71e6b2");
+        assert_eq!(sess.cwd, "/home/u/codex-app");
+        assert_eq!(sess.model, "gpt-5.6");
+        assert_eq!(sess.title, "Run the checks [image]");
+        assert_eq!(msgs.len(), 5);
+        assert_eq!(
+            msgs[0].blocks,
+            vec![Block::Text("Run the checks\n[image]".into())]
+        );
+        assert_eq!(
+            msgs[1].blocks,
+            vec![Block::Thinking("inspect first".into())]
+        );
+        assert_eq!(msgs[2].blocks, vec![Block::Text("Checking".into())]);
+        assert_eq!(
+            msgs[3].blocks,
+            vec![Block::ToolCall {
+                id: "call_1".into(),
+                name: "shell_command".into(),
+                args: json!({"command": "cargo test"}),
+            }]
+        );
+        assert_eq!(msgs[4].role, Role::Tool);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn summaries_count_only_conversation_messages() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let claude = format!(
+            "{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"user","message":{"role":"system","content":"ignore"},"uuid":"0","parentUuid":null,"cwd":"/x","isSidechain":false}"#,
+            r#"{"type":"progress","message":{"role":"user","content":"ignore"},"uuid":"1","parentUuid":"0","cwd":"/x","isSidechain":false}"#,
+            r#"{"type":"user","message":{"role":"user","content":"keep"},"uuid":"2","parentUuid":"1","cwd":"/x","isSidechain":false}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","model":"first","content":[{"type":"text","text":"answer"}]},"uuid":"3","parentUuid":"2","cwd":"/x","isSidechain":false}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","model":"later","content":[{"type":"text","text":"answer 2"}]},"uuid":"4","parentUuid":"3","cwd":"/x","isSidechain":false}"#,
+        );
+        let claude_path = write_fixture(&dir, "claude.jsonl", &claude);
+        let claude_sum = summarize(&claude_path, Harness::Claude).unwrap();
+        assert_eq!(claude_sum.msgs, 3);
+        assert_eq!(claude_sum.preview, "keep");
+        assert_eq!(claude_sum.model, "first");
+
+        let codex = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+            r#"{"type":"session_meta","payload":{"id":"c1","cwd":"/x"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{}","call_id":"call"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"ignore"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"later"}]}}"#,
+            r#"{"type":"turn_context","payload":{"model":"first"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"later"}}"#,
+        );
+        let codex_path = write_fixture(&dir, "codex.jsonl", &codex);
+        let codex_sum = summarize(&codex_path, Harness::Codex).unwrap();
+        assert_eq!(codex_sum.msgs, 3);
+        assert_eq!(codex_sum.preview, "keep");
+        assert_eq!(codex_sum.model, "first");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn claude_write_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = write_fixture(&dir, "source.jsonl", CLAUDE);
+        let (sess, msgs) = parse(&src, Harness::Claude).unwrap();
+        let store = test_store(&dir);
+        let pi = write_session(&store, Harness::Pi, &sess, &msgs).unwrap();
+        let pi_msgs = parse(&pi, Harness::Pi).unwrap().1;
+        assert_eq!(pi_msgs[..2], msgs[..2]);
+        assert!(matches!(
+            &pi_msgs[2].blocks[0],
+            Block::ToolResult {
+                call_id,
+                name: Some(name),
+                content,
+                is_error: false,
+            } if call_id == "toolu_1" && name == "Read" && content == "parser body"
+        ));
+
+        let out = write_session(&store, Harness::Claude, &sess, &tool_msgs()).unwrap();
+        assert!(out.starts_with(store.claude.join(slug_for(Harness::Claude, &sess.cwd))));
+        assert_eq!(out.file_stem().unwrap().to_string_lossy().len(), 36);
+        let lines = read_lines(&out);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["parentUuid"], Value::Null);
+        assert_eq!(lines[1]["parentUuid"], lines[0]["uuid"]);
+        assert_eq!(lines[2]["parentUuid"], lines[1]["uuid"]);
+        assert_eq!(lines[1]["message"]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(lines[1]["message"]["content"][0]["type"], "tool_result");
+        let reparsed = parse(&out, Harness::Claude).unwrap().1;
+        assert_eq!(
+            reparsed
+                .iter()
+                .map(|m| (m.role, &m.blocks))
+                .collect::<Vec<_>>(),
+            tool_msgs()
+                .iter()
+                .map(|m| (m.role, &m.blocks))
+                .collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_write_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = write_fixture(&dir, "rollout-source.jsonl", CODEX);
+        let (sess, msgs) = parse(&src, Harness::Codex).unwrap();
+        let store = test_store(&dir);
+        let factory = write_session(&store, Harness::Factory, &sess, &msgs).unwrap();
+        assert_eq!(parse(&factory, Harness::Factory).unwrap().1, msgs);
+
+        let out = write_session(&store, Harness::Codex, &sess, &msgs).unwrap();
+        let lines = read_lines(&out);
+        assert_eq!(lines[0]["type"], "session_meta");
+        assert_eq!(lines[0]["payload"]["id"], lines[0]["payload"]["session_id"]);
+        for (ordinal, line) in lines.iter().enumerate() {
+            assert_eq!(line["ordinal"], ordinal);
+        }
+        let call = lines
+            .iter()
+            .find(|line| line["payload"]["type"] == "function_call")
+            .unwrap();
+        assert!(call["payload"]["arguments"].is_string());
+        let output = lines
+            .iter()
+            .find(|line| line["payload"]["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(output["payload"]["output"], "ok");
+        assert_eq!(parse(&out, Harness::Codex).unwrap().1, msgs);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_discovery_filters_cwd_recursively() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        let day = dir.join("2026/08/16");
+        fs::create_dir_all(&day).unwrap();
+        write_fixture(&day, "rollout-2026-08-16T02-00-00-a.jsonl", CODEX);
+        write_fixture(
+            &day,
+            "rollout-2026-08-16T03-00-00-b.jsonl",
+            &CODEX.replace("/home/u/codex-app", "/home/u/other"),
+        );
+        write_fixture(&day, "ignored.jsonl", CODEX);
+        let all = discover(&dir, Harness::Codex);
+        assert_eq!(all.len(), 2);
+        let found = discover_for_cwd(&dir, Harness::Codex, Path::new("/home/u/codex-app"));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].cwd, "/home/u/codex-app");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn factory_summarize_fills_new_session_title() {
         let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
         fs::create_dir_all(&dir).unwrap();
@@ -825,11 +1353,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let src = write_fixture(&dir, "src.jsonl", FACTORY);
         let (sess, msgs) = parse(&src, Harness::Factory).unwrap();
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         let out = write_session(&store, Harness::Pi, &sess, &msgs).unwrap();
         let (sess2, msgs2) = parse(&out, Harness::Pi).unwrap();
         assert_eq!(sess2.cwd, "/home/u/app");
@@ -861,11 +1385,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let src = write_fixture(&dir, "src.jsonl", PI);
         let (sess, msgs) = parse(&src, Harness::Pi).unwrap();
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         let out = write_session(&store, Harness::Factory, &sess, &msgs).unwrap();
         let (sess2, msgs2) = parse(&out, Harness::Factory).unwrap();
         assert_eq!(sess2.title, "Write a parser");
@@ -1039,11 +1559,7 @@ mod tests {
             blocks: vec![Block::Text("hi".into())],
             ts: None,
         }];
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         let out = write_session(&store, Harness::Factory, &sess, &msgs).unwrap();
         let raw = fs::read_to_string(&out).unwrap();
         let lines: Vec<Value> = raw
@@ -1069,11 +1585,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
         fs::create_dir_all(&dir).unwrap();
         let sess = bare_session(&dir, "");
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         let msgs = vec![Msg {
             role: Role::User,
             blocks: vec![Block::Text("hi".into())],
@@ -1222,6 +1734,16 @@ mod tests {
         ]
     }
 
+    fn test_store(dir: &Path) -> Store {
+        Store {
+            factory: dir.join("fac"),
+            pi: dir.join("pi"),
+            omp: dir.join("omp"),
+            claude: dir.join("claude"),
+            codex: dir.join("codex"),
+        }
+    }
+
     fn bare_session(dir: &Path, model: &str) -> Session {
         Session {
             harness: Harness::Factory,
@@ -1248,11 +1770,7 @@ mod tests {
     fn factory_write_groups_consecutive_tool_results() {
         let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
         fs::create_dir_all(&dir).unwrap();
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         let sess = bare_session(&dir, "");
         let out = write_session(&store, Harness::Factory, &sess, &tool_msgs()).unwrap();
         let lines = read_lines(&out);
@@ -1287,14 +1805,38 @@ mod tests {
     }
 
     #[test]
+    fn claude_write_groups_tools_and_gates_model() {
+        let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let store = test_store(&dir);
+
+        let sess = bare_session(&dir, "claude-fable-5");
+        let out = write_session(&store, Harness::Claude, &sess, &tool_msgs()).unwrap();
+        let lines = read_lines(&out);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["message"]["model"], "claude-fable-5");
+        assert_eq!(lines[1]["message"]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(lines[2]["message"]["content"][0]["text"], "next");
+
+        let mut tail = tool_msgs();
+        tail.pop();
+        let out2 = write_session(&store, Harness::Claude, &sess, &tail).unwrap();
+        let lines2 = read_lines(&out2);
+        assert_eq!(lines2.len(), 2);
+        assert_eq!(lines2[1]["message"]["content"].as_array().unwrap().len(), 2);
+
+        let sess2 = bare_session(&dir, "");
+        let out3 = write_session(&store, Harness::Claude, &sess2, &tool_msgs()).unwrap();
+        let lines3 = read_lines(&out3);
+        assert!(lines3[0]["message"].get("model").is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn pi_write_backfills_tool_names_and_gates_model() {
         let dir = std::env::temp_dir().join(format!("bs-test-{}", uuid()));
         fs::create_dir_all(&dir).unwrap();
-        let store = Store {
-            factory: dir.join("fac"),
-            pi: dir.join("pi"),
-            omp: dir.join("omp"),
-        };
+        let store = test_store(&dir);
         // tool names backfilled from the assistant's ToolCall blocks
         let sess = bare_session(&dir, "gpt-5.6");
         let out = write_session(&store, Harness::Pi, &sess, &tool_msgs()).unwrap();

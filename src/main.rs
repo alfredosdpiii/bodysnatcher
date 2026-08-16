@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "bodysnatcher",
     version,
-    about = "Resume any AI coding-harness session in any other harness (Factory Droid, Pi, OMP)",
+    about = "Resume any AI coding-harness session in any other harness (Factory Droid, Pi, OMP, Claude Code, Codex)",
     long_about = None
 )]
 struct Cli {
@@ -30,6 +30,13 @@ struct Cli {
     /// Override the OMP sessions dir (default ~/.omp/agent/sessions)
     #[arg(long)]
     omp_dir: Option<PathBuf>,
+    /// Override the Claude Code projects dir (default ~/.claude/projects)
+    #[arg(long)]
+    claude_dir: Option<PathBuf>,
+
+    /// Override the Codex sessions dir (default ~/.codex/sessions)
+    #[arg(long)]
+    codex_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -76,6 +83,12 @@ fn main() -> std::process::ExitCode {
     if let Some(d) = cli.omp_dir {
         store.omp = d;
     }
+    if let Some(d) = cli.claude_dir {
+        store.claude = d;
+    }
+    if let Some(d) = cli.codex_dir {
+        store.codex = d;
+    }
 
     let res = match cli.cmd {
         None => tui::run(&store, &cli.dirs),
@@ -110,7 +123,9 @@ fn convert(
     let from = from
         .or_else(|| Harness::infer_from_path(file))
         .ok_or_else(|| {
-            std::io::Error::other("cannot detect source harness; pass --from factory|pi|omp")
+            std::io::Error::other(
+                "cannot detect source harness; pass --from factory|pi|omp|claude|codex",
+            )
         })?;
 
     let mut target_store = store.clone();
@@ -119,6 +134,8 @@ fn convert(
             Harness::Factory => target_store.factory = d,
             Harness::Pi => target_store.pi = d,
             Harness::Omp => target_store.omp = d,
+            Harness::Claude => target_store.claude = d,
+            Harness::Codex => target_store.codex = d,
         }
     }
 
@@ -152,6 +169,8 @@ fn convert(
                 Harness::Factory => resume::Target::Factory,
                 Harness::Pi => resume::Target::Pi,
                 Harness::Omp => resume::Target::Omp,
+                Harness::Claude => resume::Target::Claude,
+                Harness::Codex => resume::Target::Codex,
             },
         )?;
         return resume::exec(cmd);

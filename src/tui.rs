@@ -13,6 +13,8 @@ fn harness_color(h: Harness) -> Color {
         Harness::Factory => Color::Magenta,
         Harness::Pi => Color::Cyan,
         Harness::Omp => Color::Green,
+        Harness::Claude => Color::LightRed,
+        Harness::Codex => Color::Blue,
     }
 }
 
@@ -22,6 +24,8 @@ fn target_color(t: Target) -> Color {
         Target::Factory => Color::Magenta,
         Target::Pi => Color::Cyan,
         Target::Omp => Color::Green,
+        Target::Claude => Color::LightRed,
+        Target::Codex => Color::Blue,
     }
 }
 
@@ -97,7 +101,7 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf]) -> std::io::Result<()> {
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified.unwrap_or(std::time::UNIX_EPOCH)));
     if sessions.is_empty() {
         eprintln!(
-            "bodysnatcher: no sessions found for this directory (scanned ~/.omp, ~/.pi, ~/.factory; pass --dir to add more)"
+            "bodysnatcher: no sessions found for this directory (scanned ~/.omp, ~/.pi, ~/.factory, ~/.claude, ~/.codex; pass --dir to add more)"
         );
         std::process::exit(1);
     }
@@ -193,6 +197,8 @@ fn collect(store: &Store, extra: &[PathBuf]) -> Vec<Session> {
         (Harness::Factory, &store.factory),
         (Harness::Pi, &store.pi),
         (Harness::Omp, &store.omp),
+        (Harness::Claude, &store.claude),
+        (Harness::Codex, &store.codex),
     ] {
         out.extend(crate::adapters::discover_for_cwd(root, h, &cwd));
     }
@@ -248,7 +254,7 @@ fn draw(
                 .bg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  cross-harness session stealer - factory/pi/omp"),
+        Span::raw("  cross-harness session stealer - factory/pi/omp/claude/codex"),
         Span::styled(
             format!("  {} sessions", sessions.len()),
             Style::new().fg(Color::DarkGray),
@@ -542,10 +548,14 @@ mod tests {
         assert_eq!(harness_color(Harness::Factory), Color::Magenta);
         assert_eq!(harness_color(Harness::Pi), Color::Cyan);
         assert_eq!(harness_color(Harness::Omp), Color::Green);
+        assert_eq!(harness_color(Harness::Claude), Color::LightRed);
+        assert_eq!(harness_color(Harness::Codex), Color::Blue);
         assert_eq!(target_color(Target::Auto), Color::Yellow);
         assert_eq!(target_color(Target::Factory), Color::Magenta);
         assert_eq!(target_color(Target::Pi), Color::Cyan);
         assert_eq!(target_color(Target::Omp), Color::Green);
+        assert_eq!(target_color(Target::Claude), Color::LightRed);
+        assert_eq!(target_color(Target::Codex), Color::Blue);
     }
 
     #[test]
@@ -615,6 +625,8 @@ mod tests {
             factory: dir.join("f"),
             pi: store_root,
             omp: dir.join("o"),
+            claude: dir.join("cl"),
+            codex: dir.join("cx"),
         };
         let found = collect(&store, &[extra]);
         // cwd-matching pi session + extra session; the non-matching ws is skipped.

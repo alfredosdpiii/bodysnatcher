@@ -10,6 +10,10 @@ pub enum Harness {
     Pi,
     #[value(name = "omp")]
     Omp,
+    #[value(name = "claude")]
+    Claude,
+    #[value(name = "codex")]
+    Codex,
 }
 
 impl Harness {
@@ -18,6 +22,8 @@ impl Harness {
             Harness::Factory => "FAC",
             Harness::Pi => "PI",
             Harness::Omp => "OMP",
+            Harness::Claude => "CL",
+            Harness::Codex => "CX",
         }
     }
 
@@ -26,6 +32,8 @@ impl Harness {
             Harness::Factory => "factory",
             Harness::Pi => "pi",
             Harness::Omp => "omp",
+            Harness::Claude => "claude",
+            Harness::Codex => "codex",
         }
     }
 
@@ -37,6 +45,10 @@ impl Harness {
             Some(Harness::Pi)
         } else if s.contains("/.omp/") {
             Some(Harness::Omp)
+        } else if s.contains(".claude") {
+            Some(Harness::Claude)
+        } else if s.contains("/.codex/") {
+            Some(Harness::Codex)
         } else {
             None
         }
@@ -49,6 +61,8 @@ pub struct Store {
     pub factory: PathBuf,
     pub pi: PathBuf,
     pub omp: PathBuf,
+    pub claude: PathBuf,
+    pub codex: PathBuf,
 }
 
 impl Store {
@@ -60,6 +74,8 @@ impl Store {
             factory: home.join(".factory/sessions"),
             pi: home.join(".pi/agent/sessions"),
             omp: home.join(".omp/agent/sessions"),
+            claude: home.join(".claude/projects"),
+            codex: home.join(".codex/sessions"),
         }
     }
 
@@ -68,6 +84,8 @@ impl Store {
             Harness::Factory => &self.factory,
             Harness::Pi => &self.pi,
             Harness::Omp => &self.omp,
+            Harness::Claude => &self.claude,
+            Harness::Codex => &self.codex,
         }
     }
 }
@@ -204,11 +222,13 @@ fn push(out: &mut String, v: Option<&Value>) {
 }
 
 /// Session dir slug for a cwd, per harness convention.
-/// factory: `/a/b` -> `-a-b` ; omp: strips `$HOME`, `~/Projects/x` -> `-Projects-x` ;
-/// pi: `/a/b` -> `--a-b--`.
+/// Factory: `/a/b` -> `-a-b`; Claude also replaces `_`; OMP strips `$HOME`;
+/// Pi wraps the slug with `--`; Codex does not group sessions by cwd.
 pub fn slug_for(h: Harness, cwd: &str) -> String {
     match h {
         Harness::Factory => cwd.replace('/', "-"),
+        Harness::Claude => cwd.replace(['/', '_'], "-"),
+        Harness::Codex => String::new(),
         Harness::Omp => {
             // OMP names workspace dirs relative to $HOME when cwd lives under it.
             let home = std::env::var_os("HOME")
@@ -318,6 +338,11 @@ mod tests {
             slug_for(Harness::Pi, "/home/bryan/attic/testpoc"),
             "--home-bryan-attic-testpoc--"
         );
+        assert_eq!(
+            slug_for(Harness::Claude, "/home/u/my_app"),
+            "-home-u-my-app"
+        );
+        assert_eq!(slug_for(Harness::Codex, "/home/u/app"), "");
     }
     #[test]
     fn omp_slug_strips_home() {
@@ -389,6 +414,16 @@ mod tests {
             Harness::infer_from_path(Path::new("/home/b/.pi/agent/sessions/x/y.jsonl")),
             Some(Harness::Pi)
         );
+        assert_eq!(
+            Harness::infer_from_path(Path::new("/home/b/.claude/projects/x/y.jsonl")),
+            Some(Harness::Claude)
+        );
+        assert_eq!(
+            Harness::infer_from_path(Path::new(
+                "/home/b/.codex/sessions/2026/08/16/rollout-x.jsonl"
+            )),
+            Some(Harness::Codex)
+        );
         assert_eq!(Harness::infer_from_path(Path::new("/tmp/x.jsonl")), None);
     }
     #[test]
@@ -405,6 +440,10 @@ mod tests {
         assert_eq!(Harness::Factory.full(), "factory");
         assert_eq!(Harness::Pi.full(), "pi");
         assert_eq!(Harness::Omp.full(), "omp");
+        assert_eq!(Harness::Claude.label(), "CL");
+        assert_eq!(Harness::Codex.label(), "CX");
+        assert_eq!(Harness::Claude.full(), "claude");
+        assert_eq!(Harness::Codex.full(), "codex");
     }
 
     #[test]
@@ -413,9 +452,13 @@ mod tests {
             factory: PathBuf::from("/f"),
             pi: PathBuf::from("/p"),
             omp: PathBuf::from("/o"),
+            claude: PathBuf::from("/cl"),
+            codex: PathBuf::from("/cx"),
         };
         assert_eq!(store.root(Harness::Factory), &PathBuf::from("/f"));
         assert_eq!(store.root(Harness::Pi), &PathBuf::from("/p"));
         assert_eq!(store.root(Harness::Omp), &PathBuf::from("/o"));
+        assert_eq!(store.root(Harness::Claude), &PathBuf::from("/cl"));
+        assert_eq!(store.root(Harness::Codex), &PathBuf::from("/cx"));
     }
 }
