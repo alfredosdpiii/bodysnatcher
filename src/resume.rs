@@ -1,10 +1,18 @@
+use crate::compact::Policy;
 use crate::model::{Harness, Session, Store};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
 /// Pick the resume command for a session, converting first if the target
 /// harness differs. Auto = native resume of the session's own harness.
-pub fn build(store: &Store, sess: &Session, target: Target) -> std::io::Result<Command> {
+/// A session too large for the target model's context window is compacted
+/// into a new session first (the source file is never modified).
+pub fn build(
+    store: &Store,
+    sess: &Session,
+    target: Target,
+    policy: Policy,
+) -> std::io::Result<Command> {
     let target = match target {
         Target::Auto => sess.harness,
         Target::Factory => Harness::Factory,
@@ -14,11 +22,29 @@ pub fn build(store: &Store, sess: &Session, target: Target) -> std::io::Result<C
         Target::Codex => Harness::Codex,
     };
 
-    // Converted session: write into target store, resume that instead.
-    let (path, id) = if target == sess.harness {
+    let limits = policy.limits(target);
+    let oversized = limits.is_some_and(|l| l.file_may_overflow(&sess.path));
+
+    // Converted or compacted session: write into target store, resume that instead.
+    let (path, id) = if target == sess.harness && !oversized {
         (sess.path.clone(), sess.id.clone())
     } else {
-        let (_, msgs) = crate::adapters::parse(&sess.path, sess.harness)?;
+        let (_, mut msgs) = crate::adapters::parse(&sess.path, sess.harness)?;
+        if let Some((l, c)) = limits.and_then(|l| Some((l, crate::compact::compact(&msgs, l)?))) {
+            crate::compact::report(&msgs, &c, l, target);
+            msgs = c;
+        } else if target == sess.harness {
+            // file looked big but its content fits: resume natively
+            return build(
+                store,
+                sess,
+                Target::Auto,
+                Policy {
+                    disabled: true,
+                    ..policy
+                },
+            );
+        }
         let out = crate::adapters::write_session(store, target, sess, &msgs)?;
         let out_id = crate::adapters::summarize(&out, target)
             .map(|s| s.id)
@@ -186,7 +212,7 @@ mod tests {
             claude: dir.join("claude"),
             codex: dir.join("codex"),
         };
-        let cmd = build(&store, &sess, Target::Auto).unwrap();
+        let cmd = build(&store, &sess, Target::Auto, Policy::default()).unwrap();
         assert_eq!(cmd.bin, "omp");
         assert_eq!(
             cmd.args,
@@ -230,7 +256,7 @@ mod tests {
                 preview: String::new(),
                 modified: None,
             };
-            let cmd = build(&store, &sess, target).unwrap();
+            let cmd = build(&store, &sess, target, Policy::default()).unwrap();
             assert_eq!(cmd.bin, bin);
             assert_eq!(cmd.args, args);
         }

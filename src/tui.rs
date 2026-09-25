@@ -1,3 +1,4 @@
+use crate::compact::Policy;
 use crate::model::{Harness, Session, Store, rel_age};
 use crate::resume::{Target, build, describe, exec};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -96,7 +97,7 @@ fn skip_non_press(kind: KeyEventKind) -> bool {
 fn target_col_width(line_width: u16) -> u16 {
     line_width + 1
 }
-pub fn run(store: &Store, extra_dirs: &[PathBuf]) -> std::io::Result<()> {
+pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Result<()> {
     let mut sessions = collect(store, extra_dirs);
     sessions.sort_by_key(|s| std::cmp::Reverse(s.modified.unwrap_or(std::time::UNIX_EPOCH)));
     if sessions.is_empty() {
@@ -177,7 +178,7 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf]) -> std::io::Result<()> {
                     );
                 });
                 ratatui::restore();
-                match build(store, sess, target) {
+                match build(store, sess, target, policy) {
                     Ok(cmd) => return exec(cmd),
                     Err(e) => {
                         eprintln!("bodysnatcher: {e}");

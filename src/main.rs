@@ -1,9 +1,11 @@
 mod adapters;
+mod compact;
 mod model;
 mod resume;
 mod tui;
 
 use clap::{Parser, Subcommand};
+use compact::Policy;
 use model::{Harness, Session, Store};
 use std::path::{Path, PathBuf};
 
@@ -38,6 +40,20 @@ struct Cli {
     #[arg(long)]
     codex_dir: Option<PathBuf>,
 
+    /// Target model's context window in tokens (default: detected from the
+    /// target harness' config). Sessions that fit are never compacted.
+    #[arg(long, global = true)]
+    context_window: Option<usize>,
+
+    /// Token size to compact oversized sessions down to (default 200000,
+    /// capped at 60% of the context window)
+    #[arg(long, global = true)]
+    budget: Option<usize>,
+
+    /// Never compact, even when the session exceeds the context window
+    #[arg(long, global = true)]
+    no_compact: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -61,7 +77,7 @@ enum Cmd {
         #[arg(long)]
         sessions_dir: Option<PathBuf>,
 
-        /// Only print where the session would be written
+        /// Only print where the session would be written; write nothing
         #[arg(long)]
         dry_run: bool,
 
@@ -90,8 +106,14 @@ fn main() -> std::process::ExitCode {
         store.codex = d;
     }
 
+    let policy = Policy {
+        window: cli.context_window,
+        budget: cli.budget,
+        disabled: cli.no_compact,
+    };
+
     let res = match cli.cmd {
-        None => tui::run(&store, &cli.dirs),
+        None => tui::run(&store, &cli.dirs, policy),
         Some(Cmd::Convert {
             file,
             to,
@@ -99,7 +121,7 @@ fn main() -> std::process::ExitCode {
             sessions_dir,
             dry_run,
             run,
-        }) => convert(&store, &file, to, from, sessions_dir, dry_run, run),
+        }) => convert(&store, &file, to, from, sessions_dir, dry_run, run, policy),
     };
 
     match res {
@@ -111,6 +133,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn convert(
     store: &Store,
     file: &Path,
@@ -119,6 +142,7 @@ fn convert(
     sessions_dir: Option<PathBuf>,
     dry_run: bool,
     run: bool,
+    policy: Policy,
 ) -> std::io::Result<()> {
     let from = from
         .or_else(|| Harness::infer_from_path(file))
@@ -139,7 +163,25 @@ fn convert(
         }
     }
 
-    let (sess, msgs) = adapters::parse(file, from)?;
+    let (sess, mut msgs) = adapters::parse(file, from)?;
+    if let Some(lim) = policy.limits(to)
+        && let Some(c) = compact::compact(&msgs, lim)
+    {
+        compact::report(&msgs, &c, lim, to);
+        msgs = c;
+    }
+    if dry_run {
+        let (out, _) = adapters::session_path(&target_store, to, &sess);
+        println!("{}", out.display());
+        eprintln!(
+            "bodysnatcher: dry run; would write {} session \"{}\" ({} msgs) -> {}",
+            from.full(),
+            sess.title,
+            msgs.len(),
+            out.display()
+        );
+        return Ok(());
+    }
     let out = adapters::write_session(&target_store, to, &sess, &msgs)?;
     println!("{}", out.display());
     eprintln!(
@@ -172,11 +214,13 @@ fn convert(
                 Harness::Claude => resume::Target::Claude,
                 Harness::Codex => resume::Target::Codex,
             },
+            // already compacted above if it needed to be
+            Policy {
+                disabled: true,
+                ..policy
+            },
         )?;
         return resume::exec(cmd);
-    }
-    if dry_run {
-        // printed above; nothing else to do
     }
     Ok(())
 }

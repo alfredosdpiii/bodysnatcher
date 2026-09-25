@@ -1,5 +1,6 @@
 use crate::model::{Block, Harness, Msg, Role, Session, Store, render_content, slug_for, uuid};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -296,7 +297,10 @@ fn clip(s: &str) -> String {
     }
 }
 
-/// Full parse of a session into canonical messages.
+/// Full parse of a session into canonical messages. Honors the source
+/// harness' own compaction: like the harness' reload, only the latest
+/// compaction summary plus the messages it kept are returned, never the
+/// pre-compaction history it replaced.
 pub fn parse(path: &Path, harness: Harness) -> std::io::Result<(Session, Vec<Msg>)> {
     let f = fs::File::open(path)?;
     let mut sum = summarize(path, harness).unwrap_or(Session {
@@ -310,94 +314,226 @@ pub fn parse(path: &Path, harness: Harness) -> std::io::Result<(Session, Vec<Msg
         preview: String::new(),
         modified: None,
     });
-    let mut msgs = Vec::new();
+    let mut full = Vec::new();
+    // record id -> range of `full` it produced
+    let mut spans: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut cut: Option<NativeCut> = None;
     for line in BufReader::new(f).lines().map_while(Result::ok) {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
-        let is_conv = match harness {
-            Harness::Claude => {
-                v.get("message").and_then(|m| m.get("role")).is_some()
-                    && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
-            }
-            Harness::Codex => ty == "response_item",
-            _ => ty == "message",
+        let start = full.len();
+        if native_compaction(&v, harness, &spans, start, &mut cut) {
+            continue;
+        }
+        parse_record(&v, harness, &mut full);
+        let id_key = if harness == Harness::Claude {
+            "uuid"
+        } else {
+            "id"
         };
-        if !is_conv {
-            continue;
+        if let Some(id) = v.get(id_key).and_then(Value::as_str) {
+            spans.insert(id.to_string(), (start, full.len()));
         }
-        let ts = v.get("timestamp").and_then(Value::as_str).map(String::from);
-        if harness == Harness::Codex {
-            parse_codex_item(&v["payload"], ts, &mut msgs);
-            continue;
+    }
+    let msgs = match cut {
+        None => full,
+        Some(NativeCut { mut prefix, from }) => {
+            let mut rest = full.split_off(from.min(full.len()));
+            // a kept range can open on tool results whose call was compacted away
+            let orphans = rest.iter().take_while(|m| m.role == Role::Tool).count();
+            rest.drain(..orphans);
+            if prefix.last().is_some_and(|m| m.role == Role::User)
+                && rest.first().is_some_and(|m| m.role == Role::User)
+            {
+                prefix.push(Msg {
+                    role: Role::Assistant,
+                    blocks: vec![Block::Text(
+                        "Understood. Continuing from the summary.".into(),
+                    )],
+                    ts: rest[0].ts.clone(),
+                });
+            }
+            prefix.extend(rest);
+            prefix
         }
-        let m = &v["message"];
-        let role = m.get("role").and_then(Value::as_str).unwrap_or("");
-        match harness {
-            Harness::Factory | Harness::Claude => match role {
-                "assistant" => {
-                    let blocks = assistant_blocks(&m["content"]);
-                    if !blocks.is_empty() {
-                        msgs.push(Msg {
-                            role: Role::Assistant,
-                            blocks,
-                            ts,
-                        });
-                    }
-                }
-                "user" => {
-                    let (user, tools) = split_factory_user(&m["content"], ts);
-                    if let Some(u) = user {
-                        msgs.push(u);
-                    }
-                    msgs.extend(tools);
-                }
-                _ => {}
-            },
-            Harness::Pi | Harness::Omp => match role {
-                "assistant" => {
-                    let blocks = assistant_blocks(&m["content"]);
-                    if !blocks.is_empty() {
-                        msgs.push(Msg {
-                            role: Role::Assistant,
-                            blocks,
-                            ts,
-                        });
-                    }
-                }
-                "user" => {
-                    if let Some(text) = user_text(m) {
-                        msgs.push(Msg {
-                            role: Role::User,
-                            blocks: vec![Block::Text(text)],
-                            ts,
-                        });
-                    }
-                }
-                "toolResult" => {
+    };
+    sum.msgs = msgs.len();
+    Ok((sum, msgs))
+}
+
+/// The latest native compaction seen so far: messages that stand in for the
+/// compacted history, and the index in the full parse where kept history
+/// resumes.
+struct NativeCut {
+    prefix: Vec<Msg>,
+    from: usize,
+}
+
+/// Recognize a harness' compaction record. Returns true when `v` was one
+/// (and so is not itself a conversation message).
+fn native_compaction(
+    v: &Value,
+    harness: Harness,
+    spans: &HashMap<String, (usize, usize)>,
+    now: usize,
+    cut: &mut Option<NativeCut>,
+) -> bool {
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let ts = v.get("timestamp").and_then(Value::as_str).map(String::from);
+    let summary = |text: &str| Msg {
+        role: Role::User,
+        blocks: vec![Block::Text(format!(
+            "[Summary of the earlier conversation, compacted by {}]\n\n{text}",
+            harness.full()
+        ))],
+        ts: ts.clone(),
+    };
+    let span = |key: Option<&Value>| key.and_then(Value::as_str).and_then(|id| spans.get(id));
+    match harness {
+        Harness::Claude => {
+            if v.get("subtype").and_then(Value::as_str) == Some("compact_boundary") {
+                // preserved messages sit before the boundary; the summary follows it
+                let md = &v["compactMetadata"];
+                let head = md
+                    .pointer("/preservedMessages/uuids/0")
+                    .or_else(|| md.pointer("/preservedSegment/headUuid"));
+                *cut = Some(NativeCut {
+                    prefix: Vec::new(),
+                    from: span(head).map_or(now, |s| s.0),
+                });
+                return true;
+            }
+            if v.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+                && let Some(c) = cut
+            {
+                c.prefix = vec![Msg {
+                    role: Role::User,
+                    blocks: vec![Block::Text(render_content(&v["message"]["content"]))],
+                    ts,
+                }];
+                return true;
+            }
+            false
+        }
+        Harness::Pi | Harness::Omp if ty == "compaction" => {
+            *cut = Some(NativeCut {
+                prefix: vec![summary(
+                    v.get("summary").and_then(Value::as_str).unwrap_or(""),
+                )],
+                from: span(v.get("firstKeptEntryId")).map_or(now, |s| s.0),
+            });
+            true
+        }
+        Harness::Factory if ty == "compaction_state" => {
+            // everything up to and including the anchor message was summarized
+            *cut = Some(NativeCut {
+                prefix: vec![summary(
+                    v.get("summaryText").and_then(Value::as_str).unwrap_or(""),
+                )],
+                from: span(v.pointer("/anchorMessage/id")).map_or(now, |s| s.1),
+            });
+            true
+        }
+        Harness::Codex if ty == "compacted" => {
+            let p = &v["payload"];
+            let mut prefix = Vec::new();
+            for item in p["replacement_history"].as_array().into_iter().flatten() {
+                parse_codex_item(item, ts.clone(), &mut prefix);
+            }
+            let message = p.get("message").and_then(Value::as_str).unwrap_or("");
+            if prefix.is_empty() && !message.is_empty() {
+                prefix.push(summary(message));
+            }
+            *cut = Some(NativeCut { prefix, from: now });
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Canonical messages from one conversation record.
+fn parse_record(v: &Value, harness: Harness, msgs: &mut Vec<Msg>) {
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let is_conv = match harness {
+        Harness::Claude => {
+            v.get("message").and_then(|m| m.get("role")).is_some()
+                && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
+        }
+        Harness::Codex => ty == "response_item",
+        _ => ty == "message",
+    };
+    if !is_conv {
+        return;
+    }
+    let ts = v.get("timestamp").and_then(Value::as_str).map(String::from);
+    if harness == Harness::Codex {
+        parse_codex_item(&v["payload"], ts, msgs);
+        return;
+    }
+    let m = &v["message"];
+    let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+    match harness {
+        Harness::Factory | Harness::Claude => match role {
+            "assistant" => {
+                let blocks = assistant_blocks(&m["content"]);
+                if !blocks.is_empty() {
                     msgs.push(Msg {
-                        role: Role::Tool,
-                        blocks: vec![Block::ToolResult {
-                            call_id: m
-                                .get("toolCallId")
-                                .and_then(Value::as_str)
-                                .unwrap_or("")
-                                .to_string(),
-                            name: m.get("toolName").and_then(Value::as_str).map(String::from),
-                            content: m.get("content").map(render_content).unwrap_or_default(),
-                            is_error: m.get("isError").and_then(Value::as_bool).unwrap_or(false),
-                        }],
+                        role: Role::Assistant,
+                        blocks,
                         ts,
                     });
                 }
-                _ => {}
-            },
-            Harness::Codex => unreachable!(),
-        }
+            }
+            "user" => {
+                let (user, tools) = split_factory_user(&m["content"], ts);
+                if let Some(u) = user {
+                    msgs.push(u);
+                }
+                msgs.extend(tools);
+            }
+            _ => {}
+        },
+        Harness::Pi | Harness::Omp => match role {
+            "assistant" => {
+                let blocks = assistant_blocks(&m["content"]);
+                if !blocks.is_empty() {
+                    msgs.push(Msg {
+                        role: Role::Assistant,
+                        blocks,
+                        ts,
+                    });
+                }
+            }
+            "user" => {
+                if let Some(text) = user_text(m) {
+                    msgs.push(Msg {
+                        role: Role::User,
+                        blocks: vec![Block::Text(text)],
+                        ts,
+                    });
+                }
+            }
+            "toolResult" => {
+                msgs.push(Msg {
+                    role: Role::Tool,
+                    blocks: vec![Block::ToolResult {
+                        call_id: m
+                            .get("toolCallId")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        name: m.get("toolName").and_then(Value::as_str).map(String::from),
+                        content: m.get("content").map(render_content).unwrap_or_default(),
+                        is_error: m.get("isError").and_then(Value::as_bool).unwrap_or(false),
+                    }],
+                    ts,
+                });
+            }
+            _ => {}
+        },
+        Harness::Codex => unreachable!(),
     }
-    sum.msgs = msgs.len();
-    Ok((sum, msgs))
 }
 
 fn parse_codex_item(payload: &Value, ts: Option<String>, msgs: &mut Vec<Msg>) {
@@ -552,32 +688,24 @@ fn is_boilerplate(text: &str) -> bool {
     t.is_empty() || t.starts_with("<system-reminder>") || t.starts_with("<system-notice>")
 }
 
-/// Write a converted session into the target store. Returns the new file path.
-pub fn write_session(
-    store: &Store,
-    target: Harness,
-    src: &Session,
-    msgs: &[Msg],
-) -> std::io::Result<PathBuf> {
+/// Where `write_session` would put a converted session, without touching
+/// the filesystem. Returns the path and the new session id.
+pub fn session_path(store: &Store, target: Harness, src: &Session) -> (PathBuf, String) {
     let new_id = match target {
         Harness::Factory | Harness::Claude | Harness::Codex => uuid_v4(),
         Harness::Pi | Harness::Omp => uuid(),
     };
     let ts = ts_iso(src);
     let path = match target {
-        Harness::Codex => {
-            let dir = store
-                .codex
-                .join(format!("{}/{}/{}", &ts[0..4], &ts[5..7], &ts[8..10]));
-            fs::create_dir_all(&dir)?;
-            dir.join(format!(
+        Harness::Codex => store
+            .codex
+            .join(format!("{}/{}/{}", &ts[0..4], &ts[5..7], &ts[8..10]))
+            .join(format!(
                 "rollout-{}-{new_id}.jsonl",
                 ts[..19].replace(':', "-")
-            ))
-        }
+            )),
         _ => {
             let dir = store.root(target).join(slug_for(target, &src.cwd));
-            fs::create_dir_all(&dir)?;
             let filename = match target {
                 Harness::Factory | Harness::Claude => format!("{new_id}.jsonl"),
                 Harness::Pi | Harness::Omp => {
@@ -592,6 +720,21 @@ pub fn write_session(
             dir.join(filename)
         }
     };
+    (path, new_id)
+}
+
+/// Write a converted session into the target store. Returns the new file path.
+pub fn write_session(
+    store: &Store,
+    target: Harness,
+    src: &Session,
+    msgs: &[Msg],
+) -> std::io::Result<PathBuf> {
+    let (path, new_id) = session_path(store, target, src);
+    let ts = ts_iso(src);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
     let mut w = fs::File::create(&path)?;
 
     match target {
@@ -832,7 +975,7 @@ pub fn write_session(
             writeln!(w, "{header}")?;
             // map tool-call ids -> names so Factory tool results (which carry
             // only an id) can be attributed when written out as Pi/OMP results
-            let call_names: std::collections::HashMap<&str, &str> = msgs
+            let call_names: HashMap<&str, &str> = msgs
                 .iter()
                 .flat_map(|m| m.blocks.iter())
                 .filter_map(|b| match b {
@@ -1118,6 +1261,109 @@ mod tests {
         assert_eq!(name, "Read");
         assert_eq!(args["file_path"], "auth.ts");
         fs::remove_dir_all(dir).ok();
+    }
+
+    fn parse_body(harness: Harness, body: &str) -> Vec<Msg> {
+        let dir = std::env::temp_dir().join(format!("bs-nc-{}", uuid()));
+        fs::create_dir_all(&dir).unwrap();
+        let p = write_fixture(&dir, "s.jsonl", body);
+        let (_, msgs) = parse(&p, harness).unwrap();
+        fs::remove_dir_all(dir).ok();
+        msgs
+    }
+
+    fn texts(msgs: &[Msg]) -> Vec<String> {
+        msgs.iter()
+            .map(|m| match &m.blocks[0] {
+                Block::Text(t) => t.clone(),
+                Block::ToolResult { call_id, .. } => format!("result:{call_id}"),
+                b => format!("{b:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pi_compaction_keeps_only_summary_and_kept_entries() {
+        let body = r#"{"type":"session","version":3,"id":"s","cwd":"/w"}
+{"type":"message","id":"a","message":{"role":"user","content":[{"type":"text","text":"old ask"}]}}
+{"type":"message","id":"b","message":{"role":"assistant","content":[{"type":"toolCall","id":"c1","name":"read","arguments":{}}]}}
+{"type":"message","id":"c","message":{"role":"toolResult","toolCallId":"c1","toolName":"read","content":[{"type":"text","text":"x"}]}}
+{"type":"message","id":"d","message":{"role":"user","content":[{"type":"text","text":"kept ask"}]}}
+{"type":"compaction","id":"e","summary":"did old things","firstKeptEntryId":"c"}
+{"type":"message","id":"f","message":{"role":"assistant","content":[{"type":"text","text":"after"}]}}
+"#;
+        let msgs = parse_body(Harness::Pi, body);
+        let t = texts(&msgs);
+        // orphaned tool result at the kept boundary is dropped
+        assert_eq!(t.len(), 4, "{t:?}");
+        assert!(t[0].contains("compacted by pi") && t[0].contains("did old things"));
+        assert_eq!(msgs[1].role, Role::Assistant);
+        assert_eq!(&t[2..], ["kept ask", "after"]);
+    }
+
+    #[test]
+    fn claude_compaction_orders_summary_before_preserved() {
+        let rec = |ty: &str, uuid: &str, text: &str, extra: &str| {
+            format!(
+                r#"{{"type":"{ty}","uuid":"{uuid}","message":{{"role":"{ty}","content":[{{"type":"text","text":"{text}"}}]}}{extra}}}"#
+            )
+        };
+        let body = [
+            rec("user", "u1", "old ask", ""),
+            rec("assistant", "a1", "old answer", ""),
+            rec("user", "u2", "preserved ask", ""),
+            rec("assistant", "a2", "preserved answer", ""),
+            r#"{"type":"system","subtype":"compact_boundary","uuid":"b","compactMetadata":{"preservedMessages":{"uuids":["u2","a2"]}}}"#.into(),
+            rec("user", "s", "This session is being continued", r#","isCompactSummary":true"#),
+            rec("user", "u3", "new ask", ""),
+        ]
+        .join("\n");
+        let t = texts(&parse_body(Harness::Claude, &body));
+        assert_eq!(
+            t,
+            [
+                "This session is being continued",
+                "Understood. Continuing from the summary.",
+                "preserved ask",
+                "preserved answer",
+                "new ask"
+            ]
+        );
+    }
+
+    #[test]
+    fn factory_compaction_drops_through_anchor() {
+        let body = r#"{"type":"session_start","id":"s","cwd":"/w"}
+{"type":"message","id":"m1","message":{"role":"user","content":[{"type":"text","text":"old ask"}]}}
+{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"old answer"}]}}
+{"type":"message","id":"m3","message":{"role":"user","content":[{"type":"text","text":"kept ask"}]}}
+{"type":"compaction_state","id":"c","summaryText":"earlier work","anchorMessage":{"id":"m2","index":1},"removedCount":2}
+{"type":"message","id":"m4","message":{"role":"assistant","content":[{"type":"text","text":"after"}]}}
+"#;
+        let t = texts(&parse_body(Harness::Factory, body));
+        assert_eq!(t.len(), 4, "{t:?}");
+        assert!(t[0].contains("earlier work"));
+        assert_eq!(&t[2..], ["kept ask", "after"]);
+    }
+
+    #[test]
+    fn codex_compaction_uses_replacement_history() {
+        let body = r#"{"type":"session_meta","payload":{"id":"s","cwd":"/w"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"old ask"}]}}
+{"type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"perms"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"kept ask"}]},{"type":"compaction","encrypted_content":"x"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after"}]}}
+"#;
+        let t = texts(&parse_body(Harness::Codex, body));
+        assert_eq!(t, ["kept ask", "after"]);
+    }
+
+    #[test]
+    fn session_path_does_not_touch_disk() {
+        let dir = std::env::temp_dir().join(format!("bs-sp-{}", uuid()));
+        let (p, id) = session_path(&test_store(&dir), Harness::Claude, &bare_session(&dir, ""));
+        assert!(p.starts_with(dir.join("claude")));
+        assert!(p.to_string_lossy().contains(&id));
+        assert!(!dir.exists());
     }
 
     #[test]

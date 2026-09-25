@@ -50,8 +50,36 @@ bodysnatcher convert <session.jsonl> --to factory|pi|omp|claude|codex [--from fa
 ```
 
 `--from` is auto-detected from the path. `--sessions-dir` redirects output
-(default: the target harness' real store). `--run` resumes immediately after
-writing.
+(default: the target harness' real store). `--dry-run` prints the destination
+without writing. `--run` resumes immediately after writing.
+
+### Oversized sessions
+
+Sessions the source harness already compacted are read the way that harness
+reloads them: its latest compaction summary plus the messages it kept, not the
+full pre-compaction history still sitting in the file (Claude
+`compact_boundary`, Pi/OMP `compaction`, Factory `compaction_state`, Codex
+`compacted`).
+
+A harness compacts a session by feeding it to its model, so a session larger
+than the model's context window can never be compacted once it lands. When an
+imported (or natively resumed) session exceeds the target model's context
+window, bodysnatcher writes a compacted copy instead: older history is folded
+into checkpoint messages (user requests, assistant outcomes, tools used, files
+touched, errors) and the most recent turns are kept verbatim, until the whole
+transcript fits the landing budget. Sessions that fit are written untouched.
+
+```sh
+bodysnatcher --context-window 1000000   # target model's window (default: detected)
+bodysnatcher --budget 200000            # landing size (default 200k, max 60% of window)
+bodysnatcher --no-compact               # never compact
+```
+
+The window is detected from the target harness' config where possible (Codex
+`model_context_window` / models cache, Pi `models.json`, Factory custom model
+`maxContextLimit`, Claude `[1m]` models or recent turns that used more than
+200k tokens); otherwise 272k for Codex and 200k for the rest. The flags also
+apply to `convert`.
 
 ### Store overrides
 
