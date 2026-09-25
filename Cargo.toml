@@ -1,6 +1,6 @@
 [package]
 name = "bodysnatcher"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Resume any harness' session in any other harness: Factory Droid, Pi, OMP, Claude Code, and Codex"
 license = "MIT"
