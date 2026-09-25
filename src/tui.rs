@@ -42,25 +42,38 @@ enum Action {
     PopFilter,
     ClearFilter,
     Push(char),
+    StartSearch,
     Resume,
     None,
 }
 
-fn key_action(key: &crossterm::event::KeyEvent) -> Action {
+/// While `searching` (a filter is being typed), every printable key goes to
+/// the filter; otherwise `q`/`j`/`k`/`g`/`G` are commands, `/` starts a
+/// search, and any other printable key starts one with that character.
+fn key_action(key: &crossterm::event::KeyEvent, searching: bool) -> Action {
     use Action::*;
+    let ctrl = KeyModifiers::CONTROL;
     match (key.code, key.modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL)
-        | (KeyCode::Esc, _)
-        | (KeyCode::Char('q'), _) => Quit,
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => Up,
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => Down,
-        (KeyCode::Char('g'), m) if m.is_empty() => First,
-        (KeyCode::Char('G'), _) => Last,
+        (KeyCode::Char('c'), m) if m == ctrl => Quit,
+        (KeyCode::Esc, _) if searching => ClearFilter,
+        (KeyCode::Esc, _) => Quit,
+        (KeyCode::Up, _) => Up,
+        (KeyCode::Down, _) => Down,
+        (KeyCode::Char('k' | 'p'), m) if m == ctrl => Up,
+        (KeyCode::Char('j' | 'n'), m) if m == ctrl => Down,
+        (KeyCode::Char('u'), m) if m == ctrl => ClearFilter,
         (KeyCode::Tab, _) => CycleTarget,
         (KeyCode::Backspace, _) => PopFilter,
-        (KeyCode::Char('u'), KeyModifiers::CONTROL) => ClearFilter,
-        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => Push(c),
         (KeyCode::Enter, _) => Resume,
+        (KeyCode::Char(_), m) if m.contains(ctrl) => None,
+        (KeyCode::Char(c), _) if searching => Push(c),
+        (KeyCode::Char('/'), _) => StartSearch,
+        (KeyCode::Char('q'), _) => Quit,
+        (KeyCode::Char('k'), _) => Up,
+        (KeyCode::Char('j'), _) => Down,
+        (KeyCode::Char('g'), _) => First,
+        (KeyCode::Char('G'), _) => Last,
+        (KeyCode::Char(c), _) => Push(c),
         _ => None,
     }
 }
@@ -111,6 +124,8 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Re
     let mut list = ListState::default();
     list.select(Some(0));
     let mut filter = String::new();
+    // explicit search mode (entered with `/`), kept while the filter is empty
+    let mut search_mode = false;
     let mut target = Target::Auto;
     let mut status = String::new();
     let mut err = false;
@@ -126,7 +141,16 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Re
 
         term.draw(|frame| {
             draw(
-                frame, &sessions, &visible, &mut list, sel, &filter, target, &status, err,
+                frame,
+                &sessions,
+                &visible,
+                &mut list,
+                sel,
+                &filter,
+                search_mode || !filter.is_empty(),
+                target,
+                &status,
+                err,
             );
         })?;
 
@@ -140,7 +164,8 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Re
             continue;
         }
         err = false;
-        match key_action(&key) {
+        let searching = search_mode || !filter.is_empty();
+        match key_action(&key, searching) {
             Action::Quit => {
                 ratatui::restore();
                 return Ok(());
@@ -159,7 +184,11 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Re
             Action::PopFilter => {
                 filter.pop();
             }
-            Action::ClearFilter => filter.clear(),
+            Action::ClearFilter => {
+                filter.clear();
+                search_mode = false;
+            }
+            Action::StartSearch => search_mode = true,
             Action::Push(c) => filter.push(c),
             Action::Resume => {
                 let Some(sess) = sel else { continue };
@@ -172,6 +201,7 @@ pub fn run(store: &Store, extra_dirs: &[PathBuf], policy: Policy) -> std::io::Re
                         &mut list,
                         Some(sess),
                         &filter,
+                        search_mode || !filter.is_empty(),
                         target,
                         &status,
                         err,
@@ -233,6 +263,7 @@ fn draw(
     list: &mut ListState,
     sel: Option<&Session>,
     filter: &str,
+    searching: bool,
     target: Target,
     status: &str,
     err: bool,
@@ -266,7 +297,11 @@ fn draw(
     let input = Line::from(vec![
         Span::styled(
             " search ",
-            Style::new().fg(Color::Black).bg(Color::DarkGray),
+            Style::new().fg(Color::Black).bg(if searching {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
         ),
         Span::raw(if filter.is_empty() { "▏" } else { filter }),
         Span::styled("▕", Style::new().fg(Color::DarkGray)),
@@ -300,12 +335,21 @@ fn draw(
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(outer[2]);
 
+    // The selected row is styled here rather than via `highlight_style`, which
+    // would recolor every cell, including the harness badge's text.
+    let picked = list.selected();
     let items: Vec<ListItem> = visible
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(row, &i)| {
             let s = &sessions[i];
             let age = s.modified.map(rel_age).unwrap_or_else(|| "?".into());
+            let on = picked == Some(row);
+            let accent = Style::new()
+                .fg(target_color(target))
+                .add_modifier(Modifier::BOLD);
             let line = Line::from(vec![
+                Span::styled(if on { "▐ " } else { "  " }, accent),
                 Span::styled(
                     format!(" {} ", s.harness.label()),
                     Style::new()
@@ -314,25 +358,18 @@ fn draw(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
-                Span::raw(s.title.clone()),
+                Span::styled(s.title.clone(), if on { accent } else { Style::new() }),
                 Span::styled(format!("  {age}"), Style::new().fg(Color::DarkGray)),
             ]);
             ListItem::new(line)
         })
         .collect();
-    let list_widget = List::new(items)
-        .block(
-            Block::bordered()
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(Color::DarkGray))
-                .title(" sessions "),
-        )
-        .highlight_style(
-            Style::new()
-                .fg(target_color(target))
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▐ ");
+    let list_widget = List::new(items).block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(Color::DarkGray))
+            .title(" sessions "),
+    );
     frame.render_stateful_widget(list_widget, mid[0], list);
 
     let detail = match sel {
@@ -393,7 +430,7 @@ fn draw(
 
     let hints = Line::from(vec![
         Span::styled(
-            " /jk move ",
+            " ↑↓/jk move ",
             Style::new().fg(Color::Black).bg(Color::DarkGray),
         ),
         Span::styled(
@@ -405,7 +442,7 @@ fn draw(
             Style::new().fg(Color::Black).bg(Color::DarkGray),
         ),
         Span::styled(
-            " type filter ",
+            " / search ",
             Style::new().fg(Color::Black).bg(Color::DarkGray),
         ),
         Span::styled(
@@ -413,12 +450,6 @@ fn draw(
             Style::new().fg(Color::Black).bg(Color::DarkGray),
         ),
     ]);
-    let footer = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(50)])
-        .split(outer[3]);
-    frame.render_widget(Paragraph::new(hints), footer[0]);
-
     let status_style = if err {
         Style::new()
             .fg(Color::Black)
@@ -440,6 +471,14 @@ fn draw(
     } else {
         Line::from(vec![Span::styled(format!(" {status} "), status_style)])
     };
+    let footer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Min(10),
+            Constraint::Length(target_col_width(status_line.width() as u16)),
+        ])
+        .split(outer[3]);
+    frame.render_widget(Paragraph::new(hints), footer[0]);
     frame.render_widget(
         Paragraph::new(status_line).alignment(Alignment::Right),
         footer[1],
@@ -483,27 +522,80 @@ mod tests {
         let k = |code, mods| KeyEvent::new(code, mods);
         let n = KeyModifiers::NONE;
         let ctrl = KeyModifiers::CONTROL;
-        assert_eq!(key_action(&k(KeyCode::Char('q'), n)), Action::Quit);
-        assert_eq!(key_action(&k(KeyCode::Esc, n)), Action::Quit);
-        assert_eq!(key_action(&k(KeyCode::Char('c'), ctrl)), Action::Quit);
-        assert_eq!(key_action(&k(KeyCode::Up, n)), Action::Up);
-        assert_eq!(key_action(&k(KeyCode::Char('k'), n)), Action::Up);
-        assert_eq!(key_action(&k(KeyCode::Down, n)), Action::Down);
-        assert_eq!(key_action(&k(KeyCode::Char('j'), n)), Action::Down);
-        assert_eq!(key_action(&k(KeyCode::Char('g'), n)), Action::First);
-        assert_eq!(key_action(&k(KeyCode::Char('G'), n)), Action::Last);
-        assert_eq!(key_action(&k(KeyCode::Tab, n)), Action::CycleTarget);
-        assert_eq!(key_action(&k(KeyCode::Backspace, n)), Action::PopFilter);
-        assert_eq!(
-            key_action(&k(KeyCode::Char('u'), ctrl)),
-            Action::ClearFilter
-        );
-        assert_eq!(key_action(&k(KeyCode::Char('x'), n)), Action::Push('x'));
-        assert_eq!(key_action(&k(KeyCode::Enter, n)), Action::Resume);
-        // guards: ctrl-g is neither First (guard fails) nor Push (ctrl held)
-        assert_eq!(key_action(&k(KeyCode::Char('g'), ctrl)), Action::None);
-        assert_eq!(key_action(&k(KeyCode::Char('x'), ctrl)), Action::None);
-        assert_eq!(key_action(&k(KeyCode::F(1), n)), Action::None);
+        let browse = |code, mods| key_action(&k(code, mods), false);
+        assert_eq!(browse(KeyCode::Char('q'), n), Action::Quit);
+        assert_eq!(browse(KeyCode::Esc, n), Action::Quit);
+        assert_eq!(browse(KeyCode::Char('c'), ctrl), Action::Quit);
+        assert_eq!(browse(KeyCode::Up, n), Action::Up);
+        assert_eq!(browse(KeyCode::Char('k'), n), Action::Up);
+        assert_eq!(browse(KeyCode::Down, n), Action::Down);
+        assert_eq!(browse(KeyCode::Char('j'), n), Action::Down);
+        assert_eq!(browse(KeyCode::Char('g'), n), Action::First);
+        assert_eq!(browse(KeyCode::Char('G'), n), Action::Last);
+        assert_eq!(browse(KeyCode::Char('/'), n), Action::StartSearch);
+        assert_eq!(browse(KeyCode::Tab, n), Action::CycleTarget);
+        assert_eq!(browse(KeyCode::Backspace, n), Action::PopFilter);
+        assert_eq!(browse(KeyCode::Char('u'), ctrl), Action::ClearFilter);
+        assert_eq!(browse(KeyCode::Char('x'), n), Action::Push('x'));
+        assert_eq!(browse(KeyCode::Enter, n), Action::Resume);
+        assert_eq!(browse(KeyCode::Char('g'), ctrl), Action::None);
+        assert_eq!(browse(KeyCode::Char('x'), ctrl), Action::None);
+        assert_eq!(browse(KeyCode::F(1), n), Action::None);
+
+        // searching: command letters are typed, Esc clears, ctrl/arrows move
+        let search = |code, mods| key_action(&k(code, mods), true);
+        for c in ['j', 'k', 'q', 'g', 'G', '/'] {
+            assert_eq!(search(KeyCode::Char(c), n), Action::Push(c));
+        }
+        assert_eq!(search(KeyCode::Esc, n), Action::ClearFilter);
+        assert_eq!(search(KeyCode::Char('c'), ctrl), Action::Quit);
+        assert_eq!(search(KeyCode::Char('j'), ctrl), Action::Down);
+        assert_eq!(search(KeyCode::Char('n'), ctrl), Action::Down);
+        assert_eq!(search(KeyCode::Char('k'), ctrl), Action::Up);
+        assert_eq!(search(KeyCode::Char('p'), ctrl), Action::Up);
+        assert_eq!(search(KeyCode::Down, n), Action::Down);
+        assert_eq!(search(KeyCode::Enter, n), Action::Resume);
+    }
+
+    #[test]
+    fn selected_badge_keeps_its_label_color() {
+        use ratatui::backend::TestBackend;
+        let sess = Session {
+            harness: Harness::Codex,
+            path: "/x".into(),
+            id: "id1".into(),
+            title: "Fix auth".into(),
+            cwd: "/tmp".into(),
+            model: String::new(),
+            msgs: 3,
+            preview: "p".into(),
+            modified: None,
+        };
+        let mut state = ListState::default();
+        state.select(Some(0));
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &[sess],
+                &[0],
+                &mut state,
+                None,
+                "",
+                false,
+                Target::Codex,
+                "",
+                false,
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let cell = (0..80)
+            .map(|x| &buf[(x, 3)])
+            .find(|c| c.symbol() == "X")
+            .expect("CX badge on the first row");
+        assert_eq!(cell.bg, Color::Blue);
+        assert_eq!(cell.fg, Color::Black);
     }
 
     #[test]
@@ -585,6 +677,7 @@ mod tests {
                 &mut state,
                 None,
                 "",
+                false,
                 Target::Auto,
                 "",
                 false,

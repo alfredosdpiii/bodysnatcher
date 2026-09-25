@@ -35,13 +35,14 @@ Pick one, pick a target, resume.
 
 | Key | Action |
 | --- | --- |
-| `j`/`k`, arrows | move |
+| `j`/`k`, arrows, `Ctrl-j`/`Ctrl-k` | move |
 | `g` / `G` | first / last |
-| type | filter by title, cwd, or id |
-| `Backspace`, `Ctrl-u` | edit / clear filter |
+| `/`, or any other letter | search by title, cwd, or id (while searching, every letter is typed) |
+| `Backspace`, `Ctrl-u` | edit / clear search |
+| `Esc` | leave search, or quit |
 | `Tab` | cycle target harness |
 | `Enter` | convert and resume |
-| `q`, `Esc`, `Ctrl-c` | quit |
+| `q`, `Ctrl-c` | quit |
 
 ### Headless conversion
 
